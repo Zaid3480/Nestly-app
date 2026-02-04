@@ -6,6 +6,9 @@ const router = Router();
 
 router.post("/oauth/google", UserController.googleAuth);
 
+router.post("/oauth/apple", UserController.appleAuth);
+
+
 
 router.put(
   "/profile",

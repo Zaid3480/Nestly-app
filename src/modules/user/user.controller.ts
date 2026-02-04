@@ -2,8 +2,10 @@
   import jwt from "jsonwebtoken";
   import { OAuth2Client } from "google-auth-library";
   import pool from "../../config/db.config";
+  import * as appleSigninAuth from "apple-signin-auth";
 
-  const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
   
 export class UserController {
 
@@ -36,13 +38,11 @@ static async googleAuth(req: Request, res: Response) {
     const email = payload.email;
     const googleSub = payload.sub;
 
-    // ✅ PROPER name extraction (DO NOT split payload.name)
     const firstName = payload.given_name ?? null;
     const lastName = payload.family_name ?? null;
 
     let user;
 
-    // 1️⃣ Find by google_sub FIRST
     const bySub = await pool.query(
       `SELECT * FROM users WHERE google_sub = $1 LIMIT 1`,
       [googleSub]
@@ -51,7 +51,6 @@ static async googleAuth(req: Request, res: Response) {
     if (bySub.rowCount) {
       user = bySub.rows[0];
     } else {
-      // 2️⃣ Fallback: find by email
       const byEmail = await pool.query(
         `SELECT * FROM users WHERE email = $1 LIMIT 1`,
         [email]
@@ -60,12 +59,10 @@ static async googleAuth(req: Request, res: Response) {
       if (byEmail.rowCount) {
         user = byEmail.rows[0];
 
-        // 🚫 Block inactive users
         if (!user.is_active) {
           return res.status(403).json({ message: "Account is disabled" });
         }
 
-        // 3️⃣ Attach google_sub + save name ONLY if missing
         if (!user.google_sub) {
           await pool.query(
             `
@@ -86,7 +83,6 @@ static async googleAuth(req: Request, res: Response) {
       }
     }
 
-    // 4️⃣ Create user if still not found
     if (!user) {
       const insert = await pool.query(
         `
@@ -109,7 +105,6 @@ static async googleAuth(req: Request, res: Response) {
       user = insert.rows[0];
     }
 
-    // 🔑 Issue JWT
     const token = jwt.sign(
       { id: user.id, email: user.email, role: user.role },
       process.env.JWT_SECRET!,
@@ -134,6 +129,101 @@ static async googleAuth(req: Request, res: Response) {
     });
   }
 }
+
+
+static async appleAuth(req: Request, res: Response) {
+    try {
+      const { idToken } = req.body;
+
+      if (!idToken) {
+        return res.status(400).json({ message: "idToken is required" });
+      }
+
+      const applePayload = await appleSigninAuth.verifyIdToken(idToken, {
+        audience: process.env.APPLE_CLIENT_ID!,
+        ignoreExpiration: false,
+      });
+
+      if (!applePayload?.sub) {
+        return res.status(401).json({ message: "Invalid Apple token" });
+      }
+
+      const appleSub = applePayload.sub;
+      const email = applePayload.email ?? null;
+
+      let user;
+
+      const bySub = await pool.query(
+        `SELECT * FROM users WHERE apple_sub = $1 LIMIT 1`,
+        [appleSub]
+      );
+
+      if (bySub.rowCount) {
+        user = bySub.rows[0];
+      } else if (email) {
+        const byEmail = await pool.query(
+          `SELECT * FROM users WHERE email = $1 LIMIT 1`,
+          [email]
+        );
+
+        if (byEmail.rowCount) {
+          user = byEmail.rows[0];
+
+          if (!user.is_active) {
+            return res.status(403).json({ message: "Account is disabled" });
+          }
+
+          if (!user.apple_sub) {
+            await pool.query(
+              `
+              UPDATE users
+              SET apple_sub = $1, auth_provider = 'APPLE'
+              WHERE id = $2
+              `,
+              [appleSub, user.id]
+            );
+          }
+        }
+      }
+
+      if (!user) {
+        const insert = await pool.query(
+          `
+          INSERT INTO users (
+            email, role, is_active, auth_provider, apple_sub, password_hash
+          )
+          VALUES ($1, 'USER', true, 'APPLE', $2, NULL)
+          RETURNING *
+          `,
+          [email, appleSub]
+        );
+
+        user = insert.rows[0];
+      }
+
+      const token = jwt.sign(
+        { id: user.id, email: user.email, role: user.role },
+        process.env.JWT_SECRET!,
+        { expiresIn: "1d" }
+      );
+
+      return res.status(200).json({
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          role: user.role,
+        },
+      });
+
+    } catch (error) {
+      console.error("Apple auth error:", error);
+      return res.status(500).json({
+        message: "Apple authentication failed",
+      });
+    }
+}
+
 
 
 static async updateProfile(req: Request, res: Response) {
